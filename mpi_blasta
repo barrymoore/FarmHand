@@ -1,0 +1,237 @@
+#!/usr/bin/perl
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/lib";
+use lib '/home/bmoore/mpi_test/lib64/perl5/site_perl/5.8.8/x86_64-linux-thread-multi';
+
+use Parallel::MPIcar qw(:all);
+use threads;
+use File::Temp qw(tempfile);
+use File::Util;
+use File::Path qw(rmtree);
+use Cwd;
+use File::Copy;
+use Storable qw (freeze thaw);
+
+#------------------------------------------------------------------------------------                                               
+#-----------------------------------------MAIN---------------------------------------                                               
+#------------------------------------------------------------------------------------
+my $usage = "mpi_blast* [options] <database> <query_file>
+";
+
+if (@ARGV < 2){
+    print $usage;
+    exit;
+}
+
+MPI_Init(); #initiate the MPI
+
+#------INITIATE GLOBAL VARIABLES------
+my $rank = MPI_Comm_rank(MPI_COMM_WORLD); #my proccess number
+my $size = MPI_Comm_size(MPI_COMM_WORLD); #how many proccesses
+
+my $give_me_data = 1111;
+my $mpi_data = 2222;
+my $data_available = 3333;
+my $message_length = 4444;
+my $mpi_result = 5555;
+my $mpi_error = 6666;
+
+my $thr; #internal thread for primary proccess
+my @datalines;
+
+my %active;
+
+print STDERR "Started: $rank\n";
+select((select(STDOUT), $|=1)[0]);
+
+my $blast = $0;
+$blast =~ s/.*mpi_//;
+my $db = shift @ARGV;
+my $fastafile = shift @ARGV;
+my @opt = @ARGV;
+
+mkdir("/tmp/blasta$rank");
+
+copy($db, "/tmp/blasta$rank/db");
+$db = "/tmp/blasta$rank/db";
+
+if ($blast eq 'blastp' || $blast eq 'blastx'){
+    open (XDF, "xdformat -I -p /tmp/blasta$rank/db 2>&1 |");
+    my @err = <XDF>;
+    close (XDF);
+
+    foreach my $line (@err){
+        print STDERR"XDFORMAT:\t" . $line;
+    }
+}
+elsif($blast eq 'blastn' || $blast eq 'tblastx' || $blast eq 'tblastn'){
+    open (XDF, "xdformat -I -n /tmp/blasta$rank/db 2>&1 |");
+    my @err = <XDF>;
+    close (XDF);
+    
+    foreach my $line (@err){
+	print STDERR"XDFORMAT:\t" . $line;
+    }    
+}
+elsif($blast eq 'blasta'){
+    die "Error: You should not call mpi_blasta directly\n\n$usage";
+}
+else{
+    die "Error: no valid blast type specified\n\n$usage";
+}
+
+#------Primary MPI Proccess------
+if ($rank == 0){
+
+    my @active;
+
+    open (IN, "< $fastafile");
+    my $line = join ('', <IN>);
+    close (IN);
+
+    my @datalines = ($line =~ /((?:^>.*\n)(?:(?!^>).*\n)+)/gm);
+    
+    while (my $fasta = shift  @datalines){
+	if ($size == 1){
+	    my $thr = threads->create(\&run, $blast, $db, $fasta, @opt);
+	    my ($result, $msg) =  @{$thr->join()} unless (threads->list(threads::all) == 0);
+	    
+	    print $result;
+	    print STDERR $msg;
+	}
+	
+	if ($size > 1){
+	    my $recv;
+	  
+	    MPI_Recv( \$recv, 1, MPI_INT, -2, $give_me_data, MPI_COMM_WORLD );
+
+	    my $result;	    
+	    my $err;
+
+	    if (exists $active[$recv]){
+		MPI_RecvII( \$result, $recv, $mpi_result, MPI_COMM_WORLD );
+		MPI_RecvII( \$err, $recv, $mpi_error, MPI_COMM_WORLD );
+
+		print $result;
+		print STDERR $err;
+	    }
+
+	    my $signal = 1;
+		
+	    MPI_Send(\$signal, 1, MPI_INT, $recv, $data_available, MPI_COMM_WORLD);
+	    MPI_SendII(\$fasta, $recv, $mpi_data, MPI_COMM_WORLD);
+	    
+	    $active[$recv]++;
+	}
+    }  
+ 
+    for(my $i = 1; $i < $size; $i++){
+	my $recv;
+	
+	MPI_Recv( \$recv, 1, MPI_INT, $i, $give_me_data, MPI_COMM_WORLD );
+	
+	my $result;	    
+	my $err;
+
+	if (exists $active[$recv]){
+	    MPI_RecvII( \$result, $recv, $mpi_result, MPI_COMM_WORLD );
+	    MPI_RecvII( \$err, $recv, $mpi_error, MPI_COMM_WORLD );
+	
+	    print $result;
+	    print STDERR $err;
+	}
+
+	my $signal = 0;
+	
+	MPI_Send(\$signal, 1, MPI_INT, $recv, $data_available, MPI_COMM_WORLD);
+    }
+}#------Secondary MPI Proccesses------ 
+else{    
+    my $send = $rank;
+    my $signal;
+
+    MPI_Send(\$send, 1, MPI_INT, 0, $give_me_data, MPI_COMM_WORLD); #request line
+    MPI_Recv( \$signal, 1, MPI_INT, 0, $data_available, MPI_COMM_WORLD ); #receive signal
+
+    while ($signal == 1){
+	my $recv;
+	
+	MPI_RecvII( \$recv, 0, $mpi_data, MPI_COMM_WORLD); #receive line
+	my ($result, $msg) = @{run($blast, $db, $recv, @opt)};
+	
+	MPI_Send(\$send, 1, MPI_INT, 0, $give_me_data, MPI_COMM_WORLD); #request another line
+	MPI_SendII(\$result, 0, $mpi_result, MPI_COMM_WORLD);
+	MPI_SendII(\$msg, 0, $mpi_error, MPI_COMM_WORLD);
+
+	MPI_Recv( \$signal, 1, MPI_INT, 0, $data_available, MPI_COMM_WORLD ); #receive signal
+    }
+}
+#----------
+unlink ($db);
+MPI_Finalize(); #terminate MPI
+
+#------------------------------------------------------------------------------------
+#-----------------------------------------SUBS---------------------------------------
+#------------------------------------------------------------------------------------
+sub MPI_SendII{
+    my $msg = shift @_;
+    my $target = shift @_;
+    my $tag = shift @_;
+    my $communicator = shift @_;
+
+    my $send = freeze($msg);
+
+    my $length = length($send);
+
+    MPI_Send(\$length, 1, MPI_INT, $target, 'message_length', $communicator);
+    MPI_Send(\$send, $length, MPI_CHAR, $target, $tag, $communicator);
+
+}
+
+sub MPI_RecvII{
+    my $ref = shift @_;
+    my $source = shift @_;
+    my $tag = shift @_;
+    my $communicator = shift @_;
+
+    my $length;
+    my $recv;
+
+    MPI_Recv(\$length, 1, MPI_INT, $source, 'message_length', $communicator);
+    MPI_Recv(\$recv, $length, MPI_CHAR, $source, $tag, $communicator); #receive line                                                                                                                                                        
+    ${$ref} = ${thaw($recv)};
+}
+
+sub run{
+    my $blast = shift @_;
+    my $db = shift @_;
+    my $fasta = shift @_;
+    my @opts = @_;
+
+    my $fasta_file = totemp($fasta);
+    my $error_file = totemp('');
+
+    my $command_line = "$blast $db $fasta_file " . join(' ', @opts);
+    open(BLAST, "$command_line 2> $error_file |");
+    my $result = join ('', <BLAST>);
+    close(BLAST);
+
+    open(ERR, "< $error_file");
+    my $error = join ('', <ERR>);
+    close(ERR);
+    unlink($error_file);
+    
+    return [$result, $error];
+}
+
+sub totemp{
+    my $data = shift @_;
+
+    my ($fh, $name) = tempfile();
+    print $fh $data;
+    close ($fh);
+
+    return $name;
+}

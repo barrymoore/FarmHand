@@ -1,0 +1,388 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use lib '/uufs/chpc.utah.edu/common/home/u0129786/FarmHand';
+use FarmHand;
+use File::Temp qw(tempfile);
+use Bio::SeqIO;
+use Getopt::Long;
+use Error;
+use Filesys::Df;
+use File::Basename;
+use DateTime;
+
+#-----------------------------------------------------------------------------
+#----------------------------------- MAIN ------------------------------------
+#-----------------------------------------------------------------------------
+my $usage = "
+
+Synopsis:
+
+mpi_blast --program blastp --fasta_file /path/to/file.fasta --db /path/to/db \
+	  --out_file /path/to/file.out  --time_limit 300                     \
+	  --opts 'hitdist=40 wordmask=seg postsw' --temp_dir /path/to/tmp    \
+	  --force_home --log_conf log_file.conf
+
+Description:
+
+This script will run a WU-BLAST job on one of the CHPC clusters.
+
+Options:
+
+  --program     Which blast version to use (blastn, blastp, tblastn,
+		tblastx) [blastn]
+  --fasta_file  Path to the input fasta file.
+  --db          Path to the blast database.
+  --out_file    Path to where the blast output should be sent.
+  --time_limit  The amount of time (in minutes) the controller should run
+		before cleaning up. When the controller has run for this
+		amount of time the clean code will be run.  This can prevent
+		data files from being left on the nodes (and lost) in case a
+		job runs too long.
+  --skip_file   A file that contains a list of IDs in it's first column.
+		Sequences in the input file that have an ID in the skip file
+		will be skipped.  This allows you to restart an aborted job.
+  --opts        Command line options for the blast program (must be quoted).
+  --tmp_dir     Path to a temp directory where File::Temp will create temp
+		files for the fasta sequence.
+  --node_tmp    The temp file on the node to use if there is space.  If not
+		defined, all output will go to project directory.
+  --node_space  The amount of space in Kb required on a node before local temp
+		space will be used.
+  --log_conf    The Log::log4perl configuration file.
+
+";
+
+my ($help, $program, $fasta_file, $db, $out_file, $time_limit, $skip_file,
+    $opts, $tmp_dir, $node_tmp, $node_space, $log_conf);
+
+my $opt_results = GetOptions('help'         => \$help,
+			     'program=s'    => \$program,
+			     'fasta_file=s' => \$fasta_file,
+			     'db=s'         => \$db,
+			     'out_file=s'   => \$out_file,
+			     'time_limit=i' => \$time_limit,
+			     'skip_file=s'  => \$skip_file,
+			     'opts=s'       => \$opts,
+			     'tmp_dir=s'    => \$tmp_dir,
+			     'node_tmp=s'   => \$node_tmp,
+			     'node_space=s' => \$node_space,
+			     'log_conf=s'   => \$log_conf,
+			    );
+
+die $usage unless $opt_results;
+die $usage unless ($out_file && $fasta_file && $db && $tmp_dir);
+
+$node_space ||= 2_000_000;
+
+die $usage unless grep {$program eq $_} qw(blastn blastp tblastn tblastx);
+
+my $mpi = FarmHand->new(log_conf        => $log_conf,
+			controller_node => 0,
+		       );
+
+#-----------------------------------------------------------------------------
+#----------------------------- Controller Node -------------------------------
+#-----------------------------------------------------------------------------
+#--- Here is where you define your data loop and send data off to the
+#--- worker nodes.
+#-----------------------------------------------------------------------------
+
+if ($mpi->is_controller) {
+
+	my $seqio_object = Bio::SeqIO->new(-file => $fasta_file);
+
+	# Set up time to abort and clean up if $time_limit is set
+	my $abort_time;
+	if ($time_limit) {
+		$mpi->log("Time Limit: $time_limit", 'info');
+		$abort_time = DateTime->now;
+		$abort_time->add(minutes => $time_limit);
+		$mpi->log("Abort Time: $abort_time", 'info');
+	}
+
+	# Read in the skip_file if it's defined.
+	my %skips;
+	if ($skip_file) {
+
+		open (my $IN, '<', $skip_file) ||  die "Can't open $skip_file\n$!";
+
+		while (<$IN>) {
+			my ($id) = split /\s/, $_;
+			$skips{$id}++;
+		}
+	}
+
+	# Data Loop
+	while (	my $seq_object = $seqio_object->next_seq) {
+
+		my $seq_id = $seq_object->display_id;
+
+		# Skip IDs on the skip list.
+		if (exists $skips{$seq_id}) {
+			$mpi->log("ID: $seq_id Skipped", 'info');
+			next;
+		}
+
+		my $header = $seq_id . ' ' .
+		  $seq_object->description;
+		my $seq = $seq_object->seq;
+		my $fasta = ">$header\n$seq\n";
+		$mpi->log("Sending fasta to worker: $header", 'debug');
+
+		my $results = $mpi->control_workers([$fasta, $program, $db,
+						     $opts, $tmp_dir]);
+
+		# Abort and clean up if we've set $time_limit and now is
+		# later than the limit
+		last if $time_limit && DateTime->compare(DateTime->now,
+							 $abort_time) > 0;
+
+	}
+
+	# Node Cleanup
+	while (my $node = $mpi->next_node) {
+
+		my $results = $mpi->cleanup_node($node);
+
+	}
+}
+
+else {
+
+	$mpi->do_work(init_handler    => \&init_handler,
+		      job_handler     => \&job_handler,
+		      cleanup_handler => \&cleanup_handler);
+}
+
+#-----------------------------------------------------------------------------
+#-------------------------------- SUBROUTINES --------------------------------
+#-----------------------------------------------------------------------------
+sub init_handler {
+
+	my ($out_base, $out_path, $out_suffix) =
+	  fileparse($out_file, qr/\.[^.]+$/);
+
+	# Uniquely stamp job output
+	my $job_id = $ENV{PBS_JOBID} || 'INT';
+
+	$out_path .= "${job_id}";
+
+	# Remove node_tmp dir if it already exists.
+	eval{
+		undef $!;
+		system("mkdir -p $out_path") unless -e $out_path;
+	};
+	if ($!) {
+		record Error::Simple("Couldn't create " .
+				     "$out_path: $!");
+		$mpi->log("Node:" . $mpi->rank .
+			  " couldn't create $out_path: $!",
+			  'info');
+	}
+	else {
+		$mpi->log("Node:" . $mpi->rank .
+			  " created or confirmed $out_path",
+			  'info');
+	}
+
+	my ($db_base, $db_path) = fileparse($db);
+
+	my $use_network_drive;
+
+	# How much room do we have on this node?
+	my $free;
+	if ($node_tmp) {
+
+		my $filesys = df($node_tmp);
+		$free = $filesys->{bfree};
+	}
+
+	# If the freespace is as much as we asked for use local disk
+	# for everything.
+	if ($node_tmp && $free >= $node_space) {
+
+		$node_tmp .= '/mpi_blast';
+
+		# Remove node_tmp dir if it already exists.
+		eval{
+			undef $!;
+			system("rm -rf $node_tmp") if -e $node_tmp && -d $node_tmp;
+		};
+		if ($!) {
+			record Error::Simple("Couldn't remove " .
+					     "$node_tmp: $!");
+			$mpi->log("Node:" . $mpi->rank .
+				  " couldn't remove $node_tmp: $!",
+				  'info');
+			$use_network_drive = 1;
+		}
+		else {
+			$mpi->log("Node:" . $mpi->rank .
+				  " removed $node_tmp",
+				  'info');
+		}
+
+		# Make the node_tmp directory.
+		eval{
+			undef $!;
+			system("mkdir -p $node_tmp");
+		};
+		if ($!) {
+			record Error::Simple("Couldn't mkdir " .
+					     "$node_tmp: $!");
+			$mpi->log("Node:" . $mpi->rank .
+				  " couldn't mkdir $node_tmp: $!",
+				  'info');
+			$use_network_drive = 1;
+		}
+		else {
+			$mpi->log("Node:" . $mpi->rank .
+				  " made directory $node_tmp",
+				  'info');
+		}
+
+		# Copy databases to node.
+		if (grep {$program eq $_} qw(blastn blastx)) {
+			eval {system("cp $db.xn[dst] $node_tmp")};
+		}
+		else {
+			undef $!;
+			eval {system("cp $db.xp[dst] $node_tmp")};
+		}
+		if ($!) {
+			record Error::Simple("Couldn't move $db to " .
+					     "$node_tmp: $!");
+			$mpi->log("Node:" . $mpi->rank .
+				  " couldn't copy $db to $node_tmp: $!",
+				  'info');
+			$use_network_drive = 1;
+		}
+		else {
+			$mpi->log("Node " . $mpi->rank .
+				  " copied blast databases to $node_tmp",
+				  'info');
+		}
+			$ENV{MPI_BLASTDB}  = "${node_tmp}/${db_base}";
+			$ENV{MPI_TMP}      = $node_tmp;
+			$ENV{MPI_BLASTOUT} = "${node_tmp}/${out_base}_" .
+			  $mpi->rank . "$out_suffix";
+			$mpi->log("Node:" . $mpi->rank . "set ENV vars to use node",
+				  'info');
+	}
+
+	if (! $node_tmp || $use_network_drive) {
+		$ENV{MPI_TMP}      = $tmp_dir;
+                eval{
+                        undef $!;
+			system("mkdir -p $tmp_dir") unless -e $tmp_dir;
+                };
+                if ($!) {
+                        record Error::Simple("Couldn't mkdir " .
+                                             "$tmp_dir: $!");
+                        $mpi->log("Node:" . $mpi->rank .
+                                  " couldn't mkdir $tmp_dir: $!",
+                                  'info');
+                        $use_network_drive = 1;
+                }
+                else {
+                        $mpi->log("Node:" . $mpi->rank .
+                                  " made directory $tmp_dir",
+                                  'info');
+                }
+		$ENV{MPI_BLASTDB}  = $db;
+		$ENV{MPI_BLASTOUT} = "${out_path}/${out_base}_" .
+		  $mpi->rank . "$out_suffix";
+		$mpi->log("Node " . $mpi->rank .
+			  " is going to use $tmp_dir and $db",
+			  'info');
+		return;
+	}
+}
+#-----------------------------------------------------------------------------
+sub job_handler {
+	my $data = shift;
+	my ($fasta, $program, $db, $opts, $tmp_dir) = @{$data};
+
+	my ($id) = $fasta =~ /^>(\S+)/;
+
+	my ($fasta_fh, $fasta_file) = tempfile(DIR   => $ENV{MPI_TMP},
+					       UNLINK => 1,
+					      );
+	my $results;
+
+	print $fasta_fh $fasta or die with Error::Simple("Couldn't write to $fasta_file");
+
+	my $command = "$program $ENV{MPI_BLASTDB} $fasta_file $opts >> $ENV{MPI_BLASTOUT}";
+
+	eval{
+		undef $!;
+		system($command)
+	};
+
+	if ($!) {
+		$mpi->log("ID: $id  Node: " . $mpi->rank . " Error: $!", 'info');
+		throw Error::Simple("Blast failure for $id: $!");
+	}
+
+	close $fasta_fh;
+
+	$mpi->log("ID: $id  Success", 'info');
+
+	$results ||= '';
+
+	return $results;
+}
+#-----------------------------------------------------------------------------
+sub cleanup_handler {
+
+	my ($out_base, $out_path, $out_suffix) =
+	  fileparse($out_file, qr/\.[^.]+$/);
+
+	# If an output file was written on the node, then copy it to $out_path;
+	if ($node_tmp && $ENV{MPI_BLASTOUT} =~ /$node_tmp/ &&
+	    -e $ENV{MPI_BLASTOUT}) {
+		# If $outpath isn't an existing directory then make it.
+		if (! -e $out_file || ! -d $out_file) {
+			system("mkdir -p $out_path");
+		}
+
+		eval {
+			undef $!;
+			system("mv $ENV{MPI_BLASTOUT} $out_path")
+		};
+
+		if ($!) {
+			record Error::Simple("Couldn't copy $ENV{MPI_BLASTOUT} " .
+					     "to $out_path: $!");
+			$mpi->log("Node " . $mpi->rank .
+				  " couldn't copy $ENV{MPI_BLASTOUT} " .
+				  "to $out_path: $!", 'info');
+		}
+		else {
+			$mpi->log("Node " . $mpi->rank .
+				  " moved $ENV{MPI_BLASTOUT} to $out_path", 'info');
+		}
+	}
+
+	# If a node_tmp exists and is a directory, remove it.
+	if ($node_tmp && -e $node_tmp && -d $node_tmp) {
+		eval {
+			undef $!;
+			system("rm -rf $node_tmp")
+		};
+
+		if ($!) {
+			record Error::Simple("Couldn't remove $ENV{MPI_TMP} " .
+					     ": $!");
+			$mpi->log("Node " . $mpi->rank .
+				  " remove $ENV{MPI_TMP}: $!", 'info');
+		}
+		else {
+			$mpi->log("Node " . $mpi->rank .
+				  " removed $ENV{MPI_TMP}", 'info');
+		}
+	}
+}
